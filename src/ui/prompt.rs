@@ -1,26 +1,26 @@
-use std::{error::Error, io};
+use std::error::Error;
 
-use termion::raw::RawTerminal;
 use tui::{
-  backend::TermionBackend,
   layout::{Alignment, Constraint, Direction, Layout, Rect},
-  text::Span,
+  text::{Span, Text},
   widgets::{Block, BorderType, Borders, Paragraph},
-  Frame,
 };
 
-use super::{prompt_value, util::*};
-use crate::{info::get_hostname, Greeter, Mode};
+use crate::{
+  info::get_hostname,
+  ui::{prompt_value, util::*, Frame},
+  Greeter, Mode,
+};
 
 const GREETING_INDEX: usize = 0;
 const USERNAME_INDEX: usize = 1;
 const ANSWER_INDEX: usize = 2;
 
-pub fn draw(greeter: &mut Greeter, f: &mut Frame<TermionBackend<RawTerminal<io::Stdout>>>) -> Result<(u16, u16), Box<dyn Error>> {
+pub fn draw(mut greeter: &mut Greeter, f: &mut Frame) -> Result<(u16, u16), Box<dyn Error>> {
   let size = f.size();
 
   let width = greeter.width();
-  let height = get_height(&greeter);
+  let height = get_height(greeter);
   let container_padding = greeter.container_padding();
   let prompt_padding = greeter.prompt_padding();
   let x = (size.width - width) / 2;
@@ -56,10 +56,10 @@ pub fn draw(greeter: &mut Greeter, f: &mut Frame<TermionBackend<RawTerminal<io::
     f.render_widget(greeting_label, chunks[GREETING_INDEX]);
   }
 
-  let username_text = prompt_value(fl!("username"));
+  let username_text = prompt_value(Some(fl!("username")));
   let username_label = Paragraph::new(username_text);
 
-  let username_value_text = Span::from(greeter.username.clone());
+  let username_value_text = Span::from(greeter.username.as_str());
   let username_value = Paragraph::new(username_value_text);
 
   match greeter.mode {
@@ -70,12 +70,13 @@ pub fn draw(greeter: &mut Greeter, f: &mut Frame<TermionBackend<RawTerminal<io::
         Rect::new(
           1 + chunks[USERNAME_INDEX].x + fl!("username").len() as u16,
           chunks[USERNAME_INDEX].y,
-          get_input_width(greeter, &fl!("username")),
+          get_input_width(greeter, &Some(fl!("username"))),
           1,
         ),
       );
 
-      let answer_text = if greeter.working { Span::from(fl!("wait")) } else { prompt_value(&greeter.prompt) };
+      let answer_text = if greeter.working { Span::from(fl!("wait")) } else { prompt_value(greeter.prompt.as_ref()) };
+
       let answer_label = Paragraph::new(answer_text);
 
       if greeter.mode == Mode::Password || greeter.previous_mode == Mode::Password {
@@ -94,7 +95,7 @@ pub fn draw(greeter: &mut Greeter, f: &mut Frame<TermionBackend<RawTerminal<io::
           f.render_widget(
             answer_value,
             Rect::new(
-              chunks[ANSWER_INDEX].x + greeter.prompt.chars().count() as u16,
+              chunks[ANSWER_INDEX].x + greeter.prompt_width() as u16,
               chunks[ANSWER_INDEX].y,
               get_input_width(greeter, &greeter.prompt),
               1,
@@ -104,7 +105,7 @@ pub fn draw(greeter: &mut Greeter, f: &mut Frame<TermionBackend<RawTerminal<io::
       }
 
       if let Some(message) = message {
-        let message_text = Span::from(message);
+        let message_text = Text::from(message);
         let message = Paragraph::new(message_text).alignment(Alignment::Center);
 
         f.render_widget(message, Rect::new(x, y + height, width, message_height));
@@ -116,18 +117,20 @@ pub fn draw(greeter: &mut Greeter, f: &mut Frame<TermionBackend<RawTerminal<io::
 
   match greeter.mode {
     Mode::Username => {
-      let offset = get_cursor_offset(greeter, greeter.username.chars().count());
+      let username_length = greeter.username.chars().count();
+      let offset = get_cursor_offset(&mut greeter, username_length);
 
       Ok((2 + cursor.x + fl!("username").len() as u16 + offset as u16, USERNAME_INDEX as u16 + cursor.y))
     }
 
     Mode::Password => {
-      let offset = get_cursor_offset(greeter, greeter.answer.chars().count());
+      let answer_length = greeter.answer.chars().count();
+      let offset = get_cursor_offset(&mut greeter, answer_length);
 
       if greeter.secret && !greeter.asterisks {
-        Ok((1 + cursor.x + greeter.prompt.chars().count() as u16, ANSWER_INDEX as u16 + prompt_padding + cursor.y))
+        Ok((1 + cursor.x + greeter.prompt_width() as u16, ANSWER_INDEX as u16 + prompt_padding + cursor.y))
       } else {
-        Ok((1 + cursor.x + greeter.prompt.chars().count() as u16 + offset as u16, ANSWER_INDEX as u16 + prompt_padding + cursor.y))
+        Ok((1 + cursor.x + greeter.prompt_width() as u16 + offset as u16, ANSWER_INDEX as u16 + prompt_padding + cursor.y))
       }
     }
 

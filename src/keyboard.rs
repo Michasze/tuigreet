@@ -1,29 +1,52 @@
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use greetd_ipc::Request;
-use system_shutdown::{reboot, shutdown};
-use termion::event::Key;
+use tokio::sync::RwLock;
 
 use crate::{
   event::{Event, Events},
   info::write_last_session,
-  ipc::cancel,
-  ui::{PowerOption, POWER_OPTIONS},
+  ipc::Ipc,
+  power::power,
+  ui::POWER_OPTIONS,
   Greeter, Mode,
 };
 
-pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Error>> {
-  if let Event::Input(input) = events.next()? {
+pub async fn handle(greeter: Arc<RwLock<Greeter>>, events: &mut Events, ipc: Ipc) -> Result<(), Box<dyn Error>> {
+  if let Some(Event::Key(input)) = events.next().await {
+    let mut greeter = greeter.write().await;
+
     match input {
-      Key::Esc => {
-        cancel(greeter);
-        greeter.reset();
+      KeyEvent {
+        code: KeyCode::Char('u'),
+        modifiers: KeyModifiers::CONTROL,
+      } => match greeter.mode {
+        Mode::Username => greeter.username = String::new(),
+        Mode::Password => greeter.answer = String::new(),
+        Mode::Command => greeter.new_command = String::new(),
+        _ => {}
+      },
+
+      #[cfg(debug_assertions)]
+      KeyEvent {
+        code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::CONTROL,
+      } => {
+        use crate::greeter::AuthStatus;
+
+        crate::exit(&mut greeter, AuthStatus::Cancel).await;
       }
 
-      Key::Left => greeter.cursor_offset -= 1,
-      Key::Right => greeter.cursor_offset += 1,
+      KeyEvent { code: KeyCode::Esc, .. } => {
+        Ipc::cancel(&mut greeter).await;
+        greeter.reset().await;
+      }
 
-      Key::F(2) => {
+      KeyEvent { code: KeyCode::Left, .. } => greeter.cursor_offset -= 1,
+      KeyEvent { code: KeyCode::Right, .. } => greeter.cursor_offset += 1,
+
+      KeyEvent { code: KeyCode::F(2), .. } => {
         greeter.previous_mode = match greeter.mode {
           Mode::Command | Mode::Sessions | Mode::Power => greeter.previous_mode,
           _ => greeter.mode,
@@ -33,7 +56,7 @@ pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Erro
         greeter.mode = Mode::Command;
       }
 
-      Key::F(3) => {
+      KeyEvent { code: KeyCode::F(3), .. } => {
         greeter.previous_mode = match greeter.mode {
           Mode::Command | Mode::Sessions | Mode::Power => greeter.previous_mode,
           _ => greeter.mode,
@@ -42,7 +65,7 @@ pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Erro
         greeter.mode = Mode::Sessions;
       }
 
-      Key::F(12) => {
+      KeyEvent { code: KeyCode::F(12), .. } => {
         greeter.previous_mode = match greeter.mode {
           Mode::Command | Mode::Sessions | Mode::Power => greeter.previous_mode,
           _ => greeter.mode,
@@ -51,7 +74,7 @@ pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Erro
         greeter.mode = Mode::Power;
       }
 
-      Key::Up => {
+      KeyEvent { code: KeyCode::Up, .. } => {
         if let Mode::Sessions = greeter.mode {
           if greeter.selected_session > 0 {
             greeter.selected_session -= 1;
@@ -65,7 +88,7 @@ pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Erro
         }
       }
 
-      Key::Down => {
+      KeyEvent { code: KeyCode::Down, .. } => {
         if let Mode::Sessions = greeter.mode {
           if greeter.selected_session < greeter.sessions.len() - 1 {
             greeter.selected_session += 1;
@@ -79,22 +102,31 @@ pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Erro
         }
       }
 
-      Key::Ctrl('a') => {
-        let value = match greeter.mode {
-          Mode::Username => &greeter.username,
-          _ => &greeter.answer,
+      KeyEvent {
+        code: KeyCode::Char('a'),
+        modifiers: KeyModifiers::CONTROL,
+      } => {
+        let value = {
+          match greeter.mode {
+            Mode::Username => &greeter.username,
+            _ => &greeter.answer,
+          }
         };
 
         greeter.cursor_offset = -(value.chars().count() as i16);
       }
 
-      Key::Ctrl('e') => greeter.cursor_offset = 0,
+      KeyEvent {
+        code: KeyCode::Char('e'),
+        modifiers: KeyModifiers::CONTROL,
+      } => greeter.cursor_offset = 0,
 
-      Key::Char('\n') | Key::Char('\t') => match greeter.mode {
+      KeyEvent { code: KeyCode::Enter, .. } | KeyEvent { code: KeyCode::Char('\t'), .. } => match greeter.mode {
         Mode::Username => {
           greeter.working = true;
           greeter.message = None;
-          greeter.request = Some(Request::CreateSession { username: greeter.username.clone() });
+
+          ipc.send(Request::CreateSession { username: greeter.username.clone() }).await;
           greeter.answer = String::new();
         }
 
@@ -102,16 +134,20 @@ pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Erro
           greeter.working = true;
           greeter.message = None;
 
-          greeter.request = Some(Request::PostAuthMessageResponse {
-            response: Some(greeter.answer.clone()),
-          });
+          ipc
+            .send(Request::PostAuthMessageResponse {
+              response: Some(greeter.answer.clone()),
+            })
+            .await;
 
           greeter.answer = String::new();
         }
 
         Mode::Command => {
+          let cmd = &greeter.command;
+
+          greeter.selected_session = greeter.sessions.iter().position(|(_, command)| Some(command) == cmd.as_ref()).unwrap_or(0);
           greeter.command = Some(greeter.new_command.clone());
-          greeter.selected_session = greeter.sessions.iter().position(|(_, command)| Some(command) == greeter.command.as_ref()).unwrap_or(0);
 
           if greeter.remember_session {
             write_last_session(&greeter.new_command);
@@ -121,44 +157,36 @@ pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Erro
         }
 
         Mode::Sessions => {
-          if let Some((_, command)) = greeter.sessions.get(greeter.selected_session) {
-            greeter.command = Some(command.clone());
+          let session = match greeter.sessions.get(greeter.selected_session) {
+            Some((_, command)) => Some(command.clone()),
+            _ => None,
+          };
 
+          if let Some(command) = session {
             if greeter.remember_session {
-              write_last_session(command);
+              write_last_session(&command);
             }
+
+            greeter.command = Some(command);
           }
 
           greeter.mode = greeter.previous_mode;
         }
 
         Mode::Power => {
-          let _ = match POWER_OPTIONS[greeter.selected_power_option] {
-            (PowerOption::Shutdown, _) => shutdown(),
-            (PowerOption::Reboot, _) => reboot(),
-          };
+          if let Some((option, _)) = POWER_OPTIONS.get(greeter.selected_power_option) {
+            power(&mut greeter, *option);
+          }
 
           greeter.mode = greeter.previous_mode;
         }
+
+        Mode::Processing => {}
       },
 
-      Key::Char(c) => insert_key(greeter, c),
+      KeyEvent { code: KeyCode::Char(c), .. } => insert_key(&mut greeter, c).await,
 
-      Key::Backspace | Key::Delete => delete_key(greeter, input),
-
-      Key::Ctrl('u') => match greeter.mode {
-        Mode::Username => greeter.username = String::new(),
-        Mode::Password => greeter.answer = String::new(),
-        Mode::Command => greeter.new_command = String::new(),
-        _ => {}
-      },
-
-      #[cfg(debug_assertions)]
-      Key::Ctrl('x') => {
-        use crate::config::AuthStatus;
-
-        crate::exit(greeter, AuthStatus::Cancel)?;
-      }
+      KeyEvent { code: KeyCode::Backspace, .. } | KeyEvent { code: KeyCode::Delete, .. } => delete_key(&mut greeter, input.code).await,
 
       _ => {}
     }
@@ -167,32 +195,40 @@ pub fn handle(greeter: &mut Greeter, events: &Events) -> Result<(), Box<dyn Erro
   Ok(())
 }
 
-fn insert_key(greeter: &mut Greeter, c: char) {
+async fn insert_key(greeter: &mut Greeter, c: char) {
   let value = match greeter.mode {
-    Mode::Username => &mut greeter.username,
-    Mode::Password => &mut greeter.answer,
-    Mode::Command => &mut greeter.new_command,
-    Mode::Sessions | Mode::Power => return,
+    Mode::Username => &greeter.username,
+    Mode::Password => &greeter.answer,
+    Mode::Command => &greeter.new_command,
+    Mode::Sessions | Mode::Power | Mode::Processing => return,
   };
 
   let index = (value.chars().count() as i16 + greeter.cursor_offset) as usize;
   let left = value.chars().take(index);
   let right = value.chars().skip(index);
 
-  *value = left.chain(vec![c].into_iter()).chain(right).collect();
+  let value = left.chain(vec![c].into_iter()).chain(right).collect();
+  let mode = greeter.mode;
+
+  match mode {
+    Mode::Username => greeter.username = value,
+    Mode::Password => greeter.answer = value,
+    Mode::Command => greeter.new_command = value,
+    _ => {}
+  };
 }
 
-fn delete_key(greeter: &mut Greeter, key: Key) {
+async fn delete_key(greeter: &mut Greeter, key: KeyCode) {
   let value = match greeter.mode {
-    Mode::Username => &mut greeter.username,
-    Mode::Password => &mut greeter.answer,
-    Mode::Command => &mut greeter.new_command,
-    Mode::Sessions | Mode::Power => return,
+    Mode::Username => &greeter.username,
+    Mode::Password => &greeter.answer,
+    Mode::Command => &greeter.new_command,
+    Mode::Sessions | Mode::Power | Mode::Processing => return,
   };
 
   let index = match key {
-    Key::Backspace => (value.chars().count() as i16 + greeter.cursor_offset - 1) as usize,
-    Key::Delete => (value.chars().count() as i16 + greeter.cursor_offset) as usize,
+    KeyCode::Backspace => (value.chars().count() as i16 + greeter.cursor_offset - 1) as usize,
+    KeyCode::Delete => (value.chars().count() as i16 + greeter.cursor_offset) as usize,
     _ => 0,
   };
 
@@ -200,9 +236,16 @@ fn delete_key(greeter: &mut Greeter, key: Key) {
     let left = value.chars().take(index);
     let right = value.chars().skip(index + 1);
 
-    *value = left.chain(right).collect();
+    let value = left.chain(right).collect();
 
-    if let Key::Delete = key {
+    match greeter.mode {
+      Mode::Username => greeter.username = value,
+      Mode::Password => greeter.answer = value,
+      Mode::Command => greeter.new_command = value,
+      Mode::Sessions | Mode::Power | Mode::Processing => return,
+    };
+
+    if let KeyCode::Delete = key {
       greeter.cursor_offset += 1;
     }
   }

@@ -1,24 +1,32 @@
 use std::{
+  collections::HashMap,
   convert::TryInto,
   env,
   error::Error,
   fmt::{self, Display},
-  os::unix::net::UnixStream,
   process,
+  sync::Arc,
 };
 
 use chrono::Locale;
 use getopts::{Matches, Options};
-use greetd_ipc::Request;
 use i18n_embed::DesktopLanguageRequester;
+use tokio::{
+  net::UnixStream,
+  process::Command,
+  sync::{RwLock, RwLockWriteGuard},
+};
 use zeroize::Zeroize;
 
-use crate::info::{get_issue, get_last_session, get_last_username};
+use crate::{
+  info::{get_issue, get_last_session, get_last_username},
+  power::PowerOption,
+};
 
 const DEFAULT_LOCALE: Locale = Locale::en_US;
 const DEFAULT_ASTERISKS_CHAR: char = '*';
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum AuthStatus {
   Success,
   Failure,
@@ -33,7 +41,7 @@ impl Display for AuthStatus {
 
 impl Error for AuthStatus {}
 
-#[derive(SmartDefault, Copy, Clone, PartialEq)]
+#[derive(SmartDefault, Debug, Copy, Clone, PartialEq)]
 pub enum Mode {
   #[default]
   Username,
@@ -41,6 +49,7 @@ pub enum Mode {
   Command,
   Sessions,
   Power,
+  Processing,
 }
 
 #[derive(SmartDefault)]
@@ -49,8 +58,7 @@ pub struct Greeter {
   pub locale: Locale,
   pub config: Option<Matches>,
   pub socket: String,
-  pub stream: Option<UnixStream>,
-  pub request: Option<Request>,
+  pub stream: Option<Arc<RwLock<UnixStream>>>,
 
   pub mode: Mode,
   pub previous_mode: Mode,
@@ -65,7 +73,7 @@ pub struct Greeter {
   pub selected_power_option: usize,
 
   pub username: String,
-  pub prompt: String,
+  pub prompt: Option<String>,
   pub answer: String,
   pub secret: bool,
 
@@ -77,8 +85,13 @@ pub struct Greeter {
   pub greeting: Option<String>,
   pub message: Option<String>,
 
+  pub power_commands: HashMap<PowerOption, String>,
+  pub power_command: Option<Command>,
+  pub power_setsid: bool,
+
   pub working: bool,
   pub done: bool,
+  pub exit: Option<AuthStatus>,
 }
 
 impl Drop for Greeter {
@@ -88,11 +101,11 @@ impl Drop for Greeter {
 }
 
 impl Greeter {
-  pub fn new() -> Self {
+  pub async fn new() -> Self {
     let mut greeter = Self::default();
 
     greeter.set_locale();
-    greeter.parse_options();
+    greeter.parse_options().await;
     greeter.sessions = crate::info::get_sessions(&greeter).unwrap_or_default();
 
     if let Some((_, command)) = greeter.sessions.get(0) {
@@ -126,19 +139,19 @@ impl Greeter {
     }
   }
 
-  pub fn reset(&mut self) {
+  pub async fn reset(&mut self) {
     self.mode = Mode::Username;
     self.previous_mode = Mode::Username;
     self.working = false;
     self.done = false;
 
     self.scrub(false);
-    self.connect();
+    self.connect().await;
   }
 
-  pub fn connect(&mut self) {
-    match UnixStream::connect(&self.socket) {
-      Ok(stream) => self.stream = Some(stream),
+  pub async fn connect(&mut self) {
+    match UnixStream::connect(&self.socket).await {
+      Ok(stream) => self.stream = Some(Arc::new(RwLock::new(stream))),
 
       Err(err) => {
         eprintln!("{}", err);
@@ -151,8 +164,8 @@ impl Greeter {
     self.config.as_ref().unwrap()
   }
 
-  pub fn stream(&self) -> &UnixStream {
-    self.stream.as_ref().unwrap()
+  pub async fn stream(&self) -> RwLockWriteGuard<'_, UnixStream> {
+    self.stream.as_ref().unwrap().write().await
   }
 
   pub fn option(&self, name: &str) -> Option<String> {
@@ -211,7 +224,7 @@ impl Greeter {
     }
   }
 
-  fn parse_options(&mut self) {
+  async fn parse_options(&mut self) {
     let mut opts = Options::new();
 
     opts.optflag("h", "help", "show this usage information");
@@ -230,11 +243,15 @@ impl Greeter {
     opts.optopt("", "container-padding", "padding inside the main prompt container (default: 1)", "PADDING");
     opts.optopt("", "prompt-padding", "padding between prompt rows (default: 1)", "PADDING");
 
+    opts.optopt("", "power-shutdown", "command to run to shut down the system", "'CMD [ARGS]...'");
+    opts.optopt("", "power-reboot", "command to run to reboot the system", "'CMD [ARGS]...'");
+    opts.optflag("", "power-no-setsid", "do not prefix power commands with setsid");
+
     self.config = match opts.parse(&env::args().collect::<Vec<String>>()) {
       Ok(matches) => Some(matches),
 
-      Err(error) => {
-        eprintln!("{}", error);
+      Err(err) => {
+        eprintln!("{}", err);
         print_usage(opts);
         process::exit(1);
       }
@@ -285,11 +302,31 @@ impl Greeter {
       self.greeting = get_issue();
     }
 
-    self.connect();
+    if let Some(command) = self.config().opt_str("power-shutdown") {
+      self.power_commands.insert(PowerOption::Shutdown, command);
+    }
+    if let Some(command) = self.config().opt_str("power-reboot") {
+      self.power_commands.insert(PowerOption::Reboot, command);
+    }
+
+    self.power_setsid = !self.config().opt_present("power-no-setsid");
+
+    self.connect().await;
   }
 
   pub fn set_prompt(&mut self, prompt: &str) {
-    self.prompt = if prompt.ends_with(' ') { prompt.into() } else { format!("{} ", prompt) };
+    self.prompt = if prompt.ends_with(' ') { Some(prompt.into()) } else { Some(format!("{} ", prompt)) };
+  }
+
+  pub fn remove_prompt(&mut self) {
+    self.prompt = None;
+  }
+
+  pub fn prompt_width(&self) -> usize {
+    match &self.prompt {
+      None => 0,
+      Some(prompt) => prompt.chars().count(),
+    }
   }
 }
 

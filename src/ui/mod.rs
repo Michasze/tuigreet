@@ -1,5 +1,7 @@
 mod command;
+mod i18n;
 mod power;
+mod processing;
 mod prompt;
 mod sessions;
 mod util;
@@ -7,30 +9,41 @@ mod util;
 use std::{
   error::Error,
   io::{self, Write},
+  sync::Arc,
 };
 
 use chrono::prelude::*;
-use termion::raw::RawTerminal;
+use tokio::sync::RwLock;
 use tui::{
-  backend::TermionBackend,
+  backend::CrosstermBackend,
   layout::{Alignment, Constraint, Direction, Layout},
   style::{Modifier, Style},
   text::{Span, Spans},
   widgets::Paragraph,
-  Terminal,
+  Frame as CrosstermFrame, Terminal,
 };
 
-use crate::{info::capslock_status, ui::util::titleize, Greeter, Mode};
+use crate::{
+  info::capslock_status,
+  ui::util::{should_hide_cursor, titleize},
+  Greeter, Mode,
+};
 
-pub use self::power::{Option as PowerOption, OPTIONS as POWER_OPTIONS};
+pub use self::{i18n::MESSAGES, power::OPTIONS as POWER_OPTIONS};
 
 const TITLEBAR_INDEX: usize = 1;
 const STATUSBAR_INDEX: usize = 3;
 const STATUSBAR_LEFT_INDEX: usize = 1;
 const STATUSBAR_RIGHT_INDEX: usize = 2;
 
-pub fn draw(terminal: &mut Terminal<TermionBackend<RawTerminal<io::Stdout>>>, greeter: &mut Greeter) -> Result<(), Box<dyn Error>> {
-  let hide_cursor = if greeter.working || greeter.mode == Mode::Sessions {
+pub(super) type Backend = CrosstermBackend<io::Stdout>;
+pub(super) type Term = Terminal<Backend>;
+pub(super) type Frame<'a> = CrosstermFrame<'a, Backend>;
+
+pub async fn draw(greeter: Arc<RwLock<Greeter>>, terminal: &mut Term) -> Result<(), Box<dyn Error>> {
+  let mut greeter = greeter.write().await;
+
+  let hide_cursor = if should_hide_cursor(&greeter) {
     terminal.hide_cursor()?;
     true
   } else {
@@ -59,13 +72,15 @@ pub fn draw(terminal: &mut Terminal<TermionBackend<RawTerminal<io::Stdout>>>, gr
       f.render_widget(time, chunks[TITLEBAR_INDEX]);
     }
 
+    let status_block_size = (size.width - (2 * greeter.window_padding())) / 2;
+
     let status_chunks = Layout::default()
       .direction(Direction::Horizontal)
       .constraints(
         [
           Constraint::Length(greeter.window_padding()),
-          Constraint::Percentage(50),
-          Constraint::Percentage(50),
+          Constraint::Length(status_block_size),
+          Constraint::Length(status_block_size),
           Constraint::Length(greeter.window_padding()),
         ]
         .as_ref(),
@@ -97,10 +112,11 @@ pub fn draw(terminal: &mut Terminal<TermionBackend<RawTerminal<io::Stdout>>>, gr
     }
 
     let cursor = match greeter.mode {
-      Mode::Command => self::command::draw(greeter, &mut f).ok(),
-      Mode::Sessions => self::sessions::draw(greeter, &mut f).ok(),
-      Mode::Power => self::power::draw(greeter, &mut f).ok(),
-      _ => self::prompt::draw(greeter, &mut f).ok(),
+      Mode::Command => self::command::draw(&mut greeter, &mut f).ok(),
+      Mode::Sessions => self::sessions::draw(&mut greeter, &mut f).ok(),
+      Mode::Power => self::power::draw(&mut greeter, &mut f).ok(),
+      Mode::Processing => self::processing::draw(&mut greeter, &mut f).ok(),
+      _ => self::prompt::draw(&mut greeter, &mut f).ok(),
     };
 
     if !hide_cursor {
@@ -133,9 +149,12 @@ where
   Span::from(titleize(&text.into()))
 }
 
-fn prompt_value<'s, S>(text: S) -> Span<'s>
+fn prompt_value<'s, S>(text: Option<S>) -> Span<'s>
 where
   S: Into<String>,
 {
-  Span::styled(text.into(), Style::default().add_modifier(Modifier::BOLD))
+  match text {
+    Some(text) => Span::styled(text.into(), Style::default().add_modifier(Modifier::BOLD)),
+    None => Span::from(""),
+  }
 }

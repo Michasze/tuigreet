@@ -4,46 +4,30 @@ extern crate smart_default;
 #[macro_use]
 mod macros;
 
-mod config;
 mod event;
+mod greeter;
 mod info;
 mod ipc;
 mod keyboard;
+mod power;
 mod ui;
 
-use std::{error::Error, io, process};
+use std::{error::Error, io, process, sync::Arc};
 
-use greetd_ipc::Request;
-use i18n_embed::{
-  fluent::{fluent_language_loader, FluentLanguageLoader},
-  DesktopLanguageRequester, LanguageLoader,
+use crossterm::{
+  execute,
+  terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen},
 };
-use lazy_static::lazy_static;
-use rust_embed::RustEmbed;
-use termion::raw::IntoRawMode;
-use tui::{backend::TermionBackend, Terminal};
+use greetd_ipc::Request;
+use tokio::sync::RwLock;
+use tui::{backend::CrosstermBackend, Terminal};
 
-pub use self::config::*;
-use self::event::Events;
+pub use self::greeter::*;
+use self::{event::Events, ipc::Ipc};
 
-#[derive(RustEmbed)]
-#[folder = "contrib/locales"]
-struct Localizations;
-
-lazy_static! {
-  static ref MESSAGES: FluentLanguageLoader = {
-    let locales = Localizations;
-    let loader = fluent_language_loader!();
-    loader.load_languages(&locales, &[loader.fallback_language()]).unwrap();
-
-    let _ = i18n_embed::select(&loader, &locales, &DesktopLanguageRequester::requested_languages());
-
-    loader
-  };
-}
-
-fn main() {
-  if let Err(error) = run() {
+#[tokio::main]
+async fn main() {
+  if let Err(error) = run().await {
     if let Some(AuthStatus::Success) = error.downcast_ref::<AuthStatus>() {
       return;
     }
@@ -52,43 +36,90 @@ fn main() {
   }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-  let mut greeter = Greeter::new();
+async fn run() -> Result<(), Box<dyn Error>> {
+  let greeter = Greeter::new().await;
+  let mut stdout = io::stdout();
 
-  let stdout = io::stdout().into_raw_mode()?;
-  let backend = TermionBackend::new(stdout);
+  enable_raw_mode()?;
+  execute!(stdout, EnterAlternateScreen)?;
+
+  let backend = CrosstermBackend::new(stdout);
   let mut terminal = Terminal::new(backend)?;
 
   terminal.clear()?;
 
-  let events = Events::new();
+  let mut events = Events::new().await;
+  let ipc = Ipc::new();
 
   if greeter.remember && !greeter.username.is_empty() {
-    greeter.request = Some(Request::CreateSession { username: greeter.username.clone() });
+    ipc.send(Request::CreateSession { username: greeter.username.clone() }).await;
   }
 
+  let greeter = Arc::new(RwLock::new(greeter));
+
+  tokio::task::spawn({
+    let greeter = greeter.clone();
+    let mut ipc = ipc.clone();
+
+    async move {
+      loop {
+        let _ = ipc.handle(greeter.clone()).await;
+      }
+    }
+  });
+
+  tokio::task::spawn({
+    let greeter = greeter.clone();
+
+    async move {
+      loop {
+        let command = greeter.write().await.power_command.take();
+
+        if let Some(command) = command {
+          power::run(&greeter, command).await;
+        }
+      }
+    }
+  });
+
   loop {
-    ui::draw(&mut terminal, &mut greeter)?;
-    ipc::handle(&mut greeter)?;
-    keyboard::handle(&mut greeter, &events)?;
+    if let Some(status) = greeter.read().await.exit {
+      return Err(status.into());
+    }
+
+    ui::draw(greeter.clone(), &mut terminal).await?;
+    keyboard::handle(greeter.clone(), &mut events, ipc.clone()).await?;
   }
 }
 
-pub fn exit(greeter: &mut Greeter, status: AuthStatus) -> Result<(), AuthStatus> {
+pub async fn exit(mut greeter: &mut Greeter, status: AuthStatus) {
   match status {
     AuthStatus::Success => {}
-    AuthStatus::Cancel | AuthStatus::Failure => ipc::cancel(greeter),
+    AuthStatus::Cancel | AuthStatus::Failure => Ipc::cancel(&mut greeter).await,
   }
 
   clear_screen();
+  let _ = disable_raw_mode();
 
-  Err(status)
+  greeter.exit = Some(status);
 }
 
 pub fn clear_screen() {
-  let backend = TermionBackend::new(io::stdout());
+  let backend = CrosstermBackend::new(io::stdout());
 
   if let Ok(mut terminal) = Terminal::new(backend) {
     let _ = terminal.clear();
   }
+}
+
+#[cfg(debug_assertions)]
+pub fn log(msg: &str) {
+  use std::io::Write;
+
+  let time = chrono::Utc::now();
+
+  let mut file = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/tuigreet.log").unwrap();
+  file.write_all(format!("{:?} - ", time).as_ref()).unwrap();
+  file.write_all(msg.as_ref()).unwrap();
+  file.write_all("\n".as_bytes()).unwrap();
 }

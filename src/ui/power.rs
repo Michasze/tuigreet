@@ -1,34 +1,29 @@
-use std::{error::Error, io};
+use std::error::Error;
 
 use lazy_static::lazy_static;
-use termion::raw::RawTerminal;
 use tui::{
-  backend::TermionBackend,
   layout::Rect,
   style::{Modifier, Style},
   text::Span,
   widgets::{Block, BorderType, Borders, Paragraph},
-  Frame,
 };
 
-use super::util::*;
-use crate::Greeter;
-
-pub enum Option {
-  Shutdown,
-  Reboot,
-}
+use crate::{
+  power::PowerOption,
+  ui::{util::*, Frame},
+  Greeter,
+};
 
 lazy_static! {
-  pub static ref OPTIONS: [(Option, String); 2] = {
+  pub static ref OPTIONS: [(PowerOption, String); 2] = {
     let shutdown = fl!("shutdown");
     let reboot = fl!("reboot");
 
-    [(Option::Shutdown, shutdown), (Option::Reboot, reboot)]
+    [(PowerOption::Shutdown, shutdown), (PowerOption::Reboot, reboot)]
   };
 }
 
-pub fn draw(greeter: &mut Greeter, f: &mut Frame<TermionBackend<RawTerminal<io::Stdout>>>) -> Result<(u16, u16), Box<dyn Error>> {
+pub fn draw(greeter: &mut Greeter, f: &mut Frame<'_>) -> Result<(u16, u16), Box<dyn Error>> {
   let size = f.size();
 
   let width = greeter.width();
@@ -45,7 +40,7 @@ pub fn draw(greeter: &mut Greeter, f: &mut Frame<TermionBackend<RawTerminal<io::
     let name = format!("{:1$}", label, greeter.width() as usize - 4);
 
     let frame = Rect::new(x + 2, y + 2 + index as u16, width, 1);
-    let option_text = get_option(&greeter, name, index);
+    let option_text = get_option(greeter, name, index);
     let option = Paragraph::new(option_text);
 
     f.render_widget(option, frame);

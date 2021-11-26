@@ -1,57 +1,45 @@
-use std::{io, sync::mpsc, thread, time::Duration};
+use std::time::Duration;
 
-use termion::{event::Key, input::TermRead};
+use crossterm::event::{Event as TermEvent, EventStream, KeyEvent};
+use futures::{future::FutureExt, StreamExt};
+use tokio::{sync::mpsc, time};
 
-pub enum Event<I> {
-  Input(I),
+const TICK_RATE: u64 = 250;
+
+pub enum Event {
+  Key(KeyEvent),
   Tick,
 }
 
 pub struct Events {
-  rx: mpsc::Receiver<Event<Key>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Config {
-  pub tick_rate: Duration,
-}
-
-impl Default for Config {
-  fn default() -> Config {
-    Config {
-      tick_rate: Duration::from_millis(250),
-    }
-  }
+  rx: mpsc::Receiver<Event>,
 }
 
 impl Events {
-  pub fn new() -> Events {
-    let (tx, rx) = mpsc::channel();
+  pub async fn new() -> Events {
+    let mut stream = EventStream::new();
+    let (tx, rx) = mpsc::channel(10);
 
-    {
-      let tx = tx.clone();
+    tokio::task::spawn(async move {
+      loop {
+        let timeout = time::sleep(Duration::from_millis(TICK_RATE));
 
-      thread::spawn(move || {
-        let stdin = io::stdin();
-
-        for key in stdin.keys().flatten() {
-          if tx.send(Event::Input(key)).is_err() {
-            return;
+        tokio::select! {
+          event = stream.next().fuse() => {
+            if let Some(Ok(TermEvent::Key(event))) = event {
+              let _ = tx.send(Event::Key(event)).await;
+            }
           }
+
+          _ = timeout => { let _ = tx.send(Event::Tick).await; },
         }
-      })
-    };
-
-    thread::spawn(move || loop {
-      let _ = tx.send(Event::Tick);
-
-      thread::sleep(Duration::from_millis(250));
+      }
     });
 
     Events { rx }
   }
 
-  pub fn next(&self) -> Result<Event<Key>, mpsc::RecvError> {
-    self.rx.recv()
+  pub async fn next(&mut self) -> Option<Event> {
+    self.rx.recv().await
   }
 }
