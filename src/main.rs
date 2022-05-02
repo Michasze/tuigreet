@@ -70,9 +70,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
   tokio::task::spawn({
     let greeter = greeter.clone();
+    let notify = greeter.read().await.power_command_notify.clone();
 
     async move {
       loop {
+        notify.notified().await;
+
         let command = greeter.write().await.power_command.take();
 
         if let Some(command) = command {
@@ -92,10 +95,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
   }
 }
 
-pub async fn exit(mut greeter: &mut Greeter, status: AuthStatus) {
+pub async fn exit(greeter: &mut Greeter, status: AuthStatus) {
   match status {
     AuthStatus::Success => {}
-    AuthStatus::Cancel | AuthStatus::Failure => Ipc::cancel(&mut greeter).await,
+    AuthStatus::Cancel | AuthStatus::Failure => Ipc::cancel(greeter).await,
   }
 
   clear_screen();
@@ -108,6 +111,7 @@ pub fn clear_screen() {
   let backend = CrosstermBackend::new(io::stdout());
 
   if let Ok(mut terminal) = Terminal::new(backend) {
+    let _ = terminal.hide_cursor();
     let _ = terminal.clear();
   }
 }

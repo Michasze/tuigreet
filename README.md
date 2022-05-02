@@ -17,9 +17,18 @@ Options:
     -g, --greeting GREETING
                         show custom text above login prompt
     -t, --time          display the current date and time
+        --time-format FORMAT
+                        custom strftime format for displaying date and time
     -r, --remember      remember last logged-in username
         --remember-session
                         remember last selected session
+        --remember-user-session
+                        remember last selected session for each user
+        --user-menu     allow graphical selection of users from a menu
+        --user-menu-min-uid UID
+                        minimum UID to display in the user selection menu
+        --user-menu-max-uid UID
+                        maximum UID to display in the user selection menu
         --asterisks     display asterisks when a secret is typed
         --asterisks-char CHAR
                         character to be used to redact secrets (default: *)
@@ -39,11 +48,11 @@ Options:
 
 ## Usage
 
-The default configuration tends to be as minimal as possible, visually speaking, only showing the authentication prompts and some minor information in the status bar. You may print your system's `/etc/issue` at the top of the prompt with `--issue` and the current date and time with `--time`. You may include a custom one-line greeting message instead of `/etc/issue` with `--greeting`.
+The default configuration tends to be as minimal as possible, visually speaking, only showing the authentication prompts and some minor information in the status bar. You may print your system's `/etc/issue` at the top of the prompt with `--issue` and the current date and time with `--time` (and possibly customize it with `--time-format`). You may include a custom one-line greeting message instead of `/etc/issue` with `--greeting`.
 
 The initial prompt container will be 80 column wide. You may change this with `--width` in case you need more space (for example, to account for large PAM challenge messages). Please refer to usage information (`--help`) for more customizaton options. Various padding settings are availble through the `*-padding` options.
 
-You can instruct `tuigreet` to remember the last username that successfully opened a session with the `--remember` option (that way, the username field will be pre-filled). Similarly, the command and session configuration can be retained between runs with the `--remember-session` option (when using this, the `--cmd` value is overridden by manual selections).
+You can instruct `tuigreet` to remember the last username that successfully opened a session with the `--remember` option (that way, the username field will be pre-filled). Similarly, the command and session configuration can be retained between runs with the `--remember-session` option (when using this, the `--cmd` value is overridden by manual selections). You can also remember the selected session per user with the `--remember-user-session` flag. In this case, the selected session will only be saved on successful authentication.
 
 You may change the command that will be executed after opening a session by hitting `F2` and amending the command. Alternatively, you can list the system-declared sessions (or custom ones) by hitting `F3`. Power options are available through `F12`.
 
@@ -83,13 +92,13 @@ On NixOS `greetd` and `tuigreet` both available via `<nixpkgs>` main repository.
 Please refer to the snippet below for the minimal `tuigreet` configuration:
 
 ```nix
-{ pkgs, lib, ... }:
+{ pkgs, ... }:
 {
   services.greetd = {
     enable = true;
     settings = {
       default_session = {
-        command = "${lib.makeBinPath [pkgs.greetd.tuigreet] }/tuigreet --time --cmd sway";
+        command = "${pkgs.greetd.tuigreet}/bin/tuigreet --time --cmd sway";
         user = "greeter";
       };
     };
@@ -159,3 +168,11 @@ command = "tuigreet --power-shutdown 'sudo systemctl poweroff'"
 ```
 
 Note that, by default, all commands are prefixed with `setsid` to completely detach the command from our TTY. If you would prefer to run the commands as is, or if `setsid` does not exist on your system, you can use `--power-no-setsid`.
+
+### User menu
+
+Optionally, a user can be selected from a menu instead of typing out their name, with the `--user-menu` option, this will present all users present in `/etc/passwd` at the time `tuigreet` was run, with a UID within the acceptable range. The values for the minimum and maximum UIDs are selected as follows, for each value:
+
+ * A user-provided value, through `--user-menu-min-uid` or `--user-menu-max-uid`;
+ * **Or**, the available values for `UID_MIN` or `UID_MAX` from `/etc/login.defs`;
+ * **Or**, hardcoded `1000` for minimum UID and `60000` for maximum UID.

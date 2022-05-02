@@ -41,6 +41,19 @@ tuigreet - A graphical console greeter for greetd
 *-t, --time*
 	Print the current date and time at the top of the screen.
 
+*--time-format FORMAT*
+	Configure a custom strftime-compliant format string for the current date
+	and time.
+
+*--user-menu*
+	Allow selecting a user from a graphical menu.
+
+*--user-menu-min-uid*
+	Minimum UID of the users to display in the selection menu.
+
+*--user-menu-max-uid*
+	Maximum UID of the users to display in the selection menu.
+
 *-r, --remember*
 	Remember the username of the last successfully opened session, so the
 	username field will be pre-filled on the next run.
@@ -48,6 +61,9 @@ tuigreet - A graphical console greeter for greetd
 *--remember-session*
 	Remember the last selected session, effectively overriding the given *--cmd*
 	option on subsequent runs.
+
+*--remember-user-session*
+	Remember the last opened session, per user (requires *--remember*).
 
 *--asterisks*
 	Add visual feedback when typing secrets, as one asterisk character for every

@@ -6,7 +6,10 @@ use tokio::sync::{
   Mutex, RwLock,
 };
 
-use crate::{info::write_last_username, AuthStatus, Greeter, Mode};
+use crate::{
+  info::{write_last_user_session, write_last_username},
+  AuthStatus, Greeter, Mode,
+};
 
 #[derive(Clone)]
 pub struct Ipc(Arc<IpcHandle>);
@@ -60,7 +63,7 @@ impl Ipc {
     Ok(())
   }
 
-  async fn parse_response(&mut self, mut greeter: &mut Greeter, response: Response) -> Result<(), Box<dyn Error>> {
+  async fn parse_response(&mut self, greeter: &mut Greeter, response: Response) -> Result<(), Box<dyn Error>> {
     match response {
       Response::AuthMessage { auth_message_type, auth_message } => match auth_message_type {
         AuthMessageType::Secret => {
@@ -100,10 +103,16 @@ impl Ipc {
       Response::Success => {
         if greeter.done {
           if greeter.remember {
-            write_last_username(&greeter.username);
+            write_last_username(&greeter.username, greeter.username_mask.as_deref());
+
+            if greeter.remember_user_session {
+              if let Some(command) = &greeter.command {
+                write_last_user_session(&greeter.username, command);
+              }
+            }
           }
 
-          crate::exit(&mut greeter, AuthStatus::Success).await;
+          crate::exit(greeter, AuthStatus::Success).await;
         } else if let Some(command) = &greeter.command {
           greeter.done = true;
           greeter.mode = Mode::Processing;
@@ -115,13 +124,13 @@ impl Ipc {
           {
             let _ = command;
 
-            crate::exit(&mut greeter, AuthStatus::Success).await;
+            crate::exit(greeter, AuthStatus::Success).await;
           }
         }
       }
 
       Response::Error { error_type, description } => {
-        Ipc::cancel(&mut greeter).await;
+        Ipc::cancel(greeter).await;
 
         match error_type {
           ErrorType::AuthError => {

@@ -8,18 +8,21 @@ use std::{
   sync::Arc,
 };
 
-use chrono::Locale;
+use chrono::{
+  format::{Item, StrftimeItems},
+  Locale,
+};
 use getopts::{Matches, Options};
 use i18n_embed::DesktopLanguageRequester;
 use tokio::{
   net::UnixStream,
   process::Command,
-  sync::{RwLock, RwLockWriteGuard},
+  sync::{Notify, RwLock, RwLockWriteGuard},
 };
 use zeroize::Zeroize;
 
 use crate::{
-  info::{get_issue, get_last_session, get_last_username},
+  info::{get_issue, get_last_session, get_last_user_name, get_last_user_session, get_last_user_username, get_min_max_uids, get_users},
   power::PowerOption,
 };
 
@@ -46,6 +49,7 @@ pub enum Mode {
   #[default]
   Username,
   Password,
+  Users,
   Command,
   Sessions,
   Power,
@@ -64,6 +68,8 @@ pub struct Greeter {
   pub previous_mode: Mode,
   pub cursor_offset: i16,
 
+  pub users: Vec<(String, Option<String>)>,
+  pub selected_user: usize,
   pub command: Option<String>,
   pub new_command: String,
   pub sessions_path: Option<String>,
@@ -73,12 +79,16 @@ pub struct Greeter {
   pub selected_power_option: usize,
 
   pub username: String,
+  pub username_mask: Option<String>,
   pub prompt: Option<String>,
   pub answer: String,
   pub secret: bool,
 
+  pub user_menu: bool,
+
   pub remember: bool,
   pub remember_session: bool,
+  pub remember_user_session: bool,
   pub asterisks: bool,
   #[default(DEFAULT_ASTERISKS_CHAR)]
   pub asterisks_char: char,
@@ -87,6 +97,7 @@ pub struct Greeter {
 
   pub power_commands: HashMap<PowerOption, String>,
   pub power_command: Option<Command>,
+  pub power_command_notify: Arc<Notify>,
   pub power_setsid: bool,
 
   pub working: bool,
@@ -115,7 +126,16 @@ impl Greeter {
     }
 
     if greeter.remember {
-      greeter.username = get_last_username().unwrap_or_default().trim().to_string();
+      if let Ok(username) = get_last_user_username() {
+        greeter.username = username.clone();
+        greeter.username_mask = get_last_user_name();
+
+        if greeter.remember_user_session {
+          if let Ok(command) = get_last_user_session(&username) {
+            greeter.command = Some(command);
+          }
+        }
+      }
     }
 
     if greeter.remember_session {
@@ -132,6 +152,7 @@ impl Greeter {
   fn scrub(&mut self, scrub_message: bool) {
     self.prompt.zeroize();
     self.username.zeroize();
+    self.username_mask.zeroize();
     self.answer.zeroize();
 
     if scrub_message {
@@ -154,7 +175,7 @@ impl Greeter {
       Ok(stream) => self.stream = Some(Arc::new(RwLock::new(stream))),
 
       Err(err) => {
-        eprintln!("{}", err);
+        eprintln!("{err}");
         process::exit(1);
       }
     }
@@ -216,7 +237,7 @@ impl Greeter {
     let locale = DesktopLanguageRequester::requested_languages()
       .into_iter()
       .next()
-      .and_then(|locale| locale.region.map(|region| format!("{}_{}", locale.language, region)))
+      .and_then(|locale| locale.region.map(|region| format!("{}_{region}", locale.language)))
       .and_then(|id| id.as_str().try_into().ok());
 
     if let Some(locale) = locale {
@@ -235,8 +256,13 @@ impl Greeter {
     opts.optflag("i", "issue", "show the host's issue file");
     opts.optopt("g", "greeting", "show custom text above login prompt", "GREETING");
     opts.optflag("t", "time", "display the current date and time");
+    opts.optopt("", "time-format", "custom strftime format for displaying date and time", "FORMAT");
     opts.optflag("r", "remember", "remember last logged-in username");
     opts.optflag("", "remember-session", "remember last selected session");
+    opts.optflag("", "remember-user-session", "remember last selected session for each user");
+    opts.optflag("", "user-menu", "allow graphical selection of users from a menu");
+    opts.optopt("", "user-menu-min-uid", "minimum UID to display in the user selection menu", "UID");
+    opts.optopt("", "user-menu-max-uid", "maximum UID to display in the user selection menu", "UID");
     opts.optflag("", "asterisks", "display asterisks when a secret is typed");
     opts.optopt("", "asterisks-char", "character to be used to redact secrets (default: *)", "CHAR");
     opts.optopt("", "window-padding", "padding inside the terminal area (default: 0)", "PADDING");
@@ -251,7 +277,7 @@ impl Greeter {
       Ok(matches) => Some(matches),
 
       Err(err) => {
-        eprintln!("{}", err);
+        eprintln!("{err}");
         print_usage(opts);
         process::exit(1);
       }
@@ -290,8 +316,42 @@ impl Greeter {
       self.asterisks_char = value.chars().next().unwrap();
     }
 
+    if let Some(format) = self.config().opt_str("time-format") {
+      if StrftimeItems::new(&format).any(|item| item == Item::Error) {
+        eprintln!("Invalid strftime format provided in --time-format");
+        process::exit(1);
+      }
+    }
+
+    if self.config().opt_present("user-menu") {
+      self.user_menu = true;
+
+      let min_uid = self.config().opt_str("user-menu-min-uid").and_then(|uid| uid.parse::<u16>().ok());
+      let max_uid = self.config().opt_str("user-menu-max-uid").and_then(|uid| uid.parse::<u16>().ok());
+      let (min_uid, max_uid) = get_min_max_uids(min_uid, max_uid);
+
+      if min_uid >= max_uid {
+        eprintln!("Minimum UID ({min_uid}) must be less than maximum UID ({max_uid})");
+        process::exit(1);
+      }
+
+      self.users = get_users(min_uid, max_uid);
+    }
+
+    if self.config().opt_present("remember-session") && self.config().opt_present("remember-user-session") {
+      eprintln!("Only one of --remember-session and --remember-user-session may be used at the same time");
+      print_usage(opts);
+      process::exit(1);
+    }
+    if self.config().opt_present("remember-user-session") && !self.config().opt_present("remember") {
+      eprintln!("--remember-session must be used with --remember");
+      print_usage(opts);
+      process::exit(1);
+    }
+
     self.remember = self.config().opt_present("remember");
     self.remember_session = self.config().opt_present("remember-session");
+    self.remember_user_session = self.config().opt_present("remember-user-session");
     self.asterisks = self.config().opt_present("asterisks");
     self.greeting = self.option("greeting");
     self.command = self.option("cmd");
@@ -315,7 +375,7 @@ impl Greeter {
   }
 
   pub fn set_prompt(&mut self, prompt: &str) {
-    self.prompt = if prompt.ends_with(' ') { Some(prompt.into()) } else { Some(format!("{} ", prompt)) };
+    self.prompt = if prompt.ends_with(' ') { Some(prompt.into()) } else { Some(format!("{prompt} ")) };
   }
 
   pub fn remove_prompt(&mut self) {
